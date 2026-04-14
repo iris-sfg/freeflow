@@ -93,6 +93,7 @@ final class PipelineHistoryStore {
                 entity.postProcessingPrompt = item.postProcessingPrompt
                 entity.postProcessingStatus = item.postProcessingStatus
                 entity.debugStatus = item.debugStatus
+                entity.detectedLanguageCode = item.detectedLanguageCode
                 try saveContext()
             } catch {
                 thrownError = error
@@ -187,6 +188,7 @@ final class PipelineHistoryStore {
                 entity.postProcessedTranscript = item.postProcessedTranscript
                 entity.postProcessingPrompt = item.postProcessingPrompt
                 entity.contextSummary = item.contextSummary
+                entity.detectedLanguageCode = item.detectedLanguageCode
                 entity.contextPrompt = item.contextPrompt
                 entity.contextScreenshotDataURL = item.contextScreenshotDataURL
                 entity.contextScreenshotStatus = item.contextScreenshotStatus
@@ -257,6 +259,7 @@ final class PipelineHistoryStore {
             postProcessedTranscript: entity.postProcessedTranscript ?? "",
             postProcessingPrompt: entity.postProcessingPrompt,
             contextSummary: entity.contextSummary ?? "",
+            detectedLanguageCode: entity.detectedLanguageCode,
             contextPrompt: entity.contextPrompt,
             contextScreenshotDataURL: entity.contextScreenshotDataURL,
             contextScreenshotStatus: entity.contextScreenshotStatus ?? "available (image)",
@@ -281,6 +284,7 @@ final class PipelineHistoryStore {
             makeAttribute(name: "postProcessedTranscript", type: .stringAttributeType, isOptional: false),
             makeAttribute(name: "postProcessingPrompt", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextSummary", type: .stringAttributeType, isOptional: false),
+            makeAttribute(name: "detectedLanguageCode", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextPrompt", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextScreenshotDataURL", type: .stringAttributeType, isOptional: true),
             makeAttribute(name: "contextScreenshotStatus", type: .stringAttributeType, isOptional: false),
@@ -311,6 +315,7 @@ final class PipelineHistoryEntry: NSManagedObject {
     @NSManaged var postProcessedTranscript: String?
     @NSManaged var postProcessingPrompt: String?
     @NSManaged var contextSummary: String?
+    @NSManaged var detectedLanguageCode: String?
     @NSManaged var contextPrompt: String?
     @NSManaged var contextScreenshotDataURL: String?
     @NSManaged var contextScreenshotStatus: String?

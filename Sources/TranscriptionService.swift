@@ -37,13 +37,13 @@ class TranscriptionService {
     }
 
     // Upload audio file, submit for transcription, poll until done, return text
-    func transcribe(fileURL: URL) async throws -> String {
+    func transcribe(fileURL: URL, languageCode: String? = nil) async throws -> String {
         return try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask { [weak self] in
                 guard let self else {
                     throw TranscriptionError.submissionFailed("Service deallocated")
                 }
-                return try await self.transcribeAudio(fileURL: fileURL)
+                return try await self.transcribeAudio(fileURL: fileURL, languageCode: languageCode)
             }
 
             group.addTask {
@@ -60,17 +60,17 @@ class TranscriptionService {
     }
 
     // Send audio file for transcription and return text
-    private func transcribeAudio(fileURL: URL) async throws -> String {
+    private func transcribeAudio(fileURL: URL, languageCode: String?) async throws -> String {
         let preparedAudio = try prepareAudioForUpload(from: fileURL)
         defer { preparedAudio.cleanup() }
 
         if forceHTTP2 {
-            return try await transcribeAudioWithCurl(fileURL: preparedAudio.fileURL)
+            return try await transcribeAudioWithCurl(fileURL: preparedAudio.fileURL, languageCode: languageCode)
         }
-        return try await transcribeAudioWithURLSession(fileURL: preparedAudio.fileURL)
+        return try await transcribeAudioWithURLSession(fileURL: preparedAudio.fileURL, languageCode: languageCode)
     }
 
-    private func transcribeAudioWithURLSession(fileURL: URL) async throws -> String {
+    private func transcribeAudioWithURLSession(fileURL: URL, languageCode: String?) async throws -> String {
         let url = URL(string: "\(baseURL)/audio/transcriptions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -83,6 +83,7 @@ class TranscriptionService {
             audioData: audioData,
             fileName: fileURL.lastPathComponent,
             model: transcriptionModel,
+            languageCode: languageCode,
             boundary: boundary
         )
 
@@ -127,11 +128,11 @@ class TranscriptionService {
         return try parseTranscript(from: data)
     }
 
-    private func transcribeAudioWithCurl(fileURL: URL) async throws -> String {
-        try await Task.detached(priority: .userInitiated) { [apiKey, transcriptionModel] in
+    private func transcribeAudioWithCurl(fileURL: URL, languageCode: String?) async throws -> String {
+        try await Task.detached(priority: .userInitiated) { [apiKey, transcriptionModel, languageCode] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-            process.arguments = [
+            var arguments = [
                 "--silent",
                 "--show-error",
                 "--fail",
@@ -142,6 +143,10 @@ class TranscriptionService {
                 "-F", "model=\(transcriptionModel)",
                 "-F", "file=@\(fileURL.path);type=\(self.audioContentType(for: fileURL.lastPathComponent))"
             ]
+            if let languageCode = self.normalizedWhisperLanguageCode(languageCode) {
+                arguments += ["-F", "language=\(languageCode)"]
+            }
+            process.arguments = arguments
 
             let stdout = Pipe()
             let stderr = Pipe()
@@ -194,7 +199,13 @@ class TranscriptionService {
         return (attributes?[.size] as? NSNumber)?.int64Value ?? -1
     }
 
-    private func makeMultipartBody(audioData: Data, fileName: String, model: String, boundary: String) -> Data {
+    private func makeMultipartBody(
+        audioData: Data,
+        fileName: String,
+        model: String,
+        languageCode: String?,
+        boundary: String
+    ) -> Data {
         var body = Data()
 
         func append(_ value: String) {
@@ -205,6 +216,12 @@ class TranscriptionService {
         append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
         append("\(model)\r\n")
 
+        if let languageCode = normalizedWhisperLanguageCode(languageCode) {
+            append("--\(boundary)\r\n")
+            append("Content-Disposition: form-data; name=\"language\"\r\n\r\n")
+            append("\(languageCode)\r\n")
+        }
+
         append("--\(boundary)\r\n")
         append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n")
         append("Content-Type: \(audioContentType(for: fileName))\r\n\r\n")
@@ -213,6 +230,19 @@ class TranscriptionService {
         append("--\(boundary)--\r\n")
 
         return body
+    }
+
+    private func normalizedWhisperLanguageCode(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !trimmed.isEmpty else {
+            return nil
+        }
+
+        let code = trimmed.split(separator: "-").first.map(String.init) ?? trimmed
+        guard (code.count == 2 || code.count == 3), code.allSatisfy(\.isLetter) else {
+            return nil
+        }
+        return code
     }
 
     private func prepareAudioForUpload(from fileURL: URL) throws -> PreparedUploadAudio {

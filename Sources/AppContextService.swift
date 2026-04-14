@@ -8,6 +8,7 @@ struct AppContext {
     let windowTitle: String?
     let selectedText: String?
     let currentActivity: String
+    let detectedLanguageCode: String?
     let contextPrompt: String?
     let screenshotDataURL: String?
     let screenshotMimeType: String?
@@ -43,7 +44,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         self.customContextPrompt = customContextPrompt
     }
 
-    func collectContext() async -> AppContext {
+    func collectContext(includeLanguageDetection: Bool = false) async -> AppContext {
         guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
             return AppContext(
                 appName: nil,
@@ -51,6 +52,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
                 windowTitle: nil,
                 selectedText: nil,
                 currentActivity: "You are dictating in an unrecognized context.",
+                detectedLanguageCode: nil,
                 contextPrompt: nil,
                 screenshotDataURL: nil,
                 screenshotMimeType: nil,
@@ -69,16 +71,25 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             appElement: appElement,
             focusedWindowTitle: windowTitle
         )
+        let metadata = contextMetadata(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle,
+            selectedText: selectedText
+        )
         let currentActivity: String
+        let detectedLanguageCode: String?
         let contextPrompt: String?
         if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            if let result = await inferActivityWithLLM(
-                appName: appName,
-                bundleIdentifier: bundleIdentifier,
-                windowTitle: windowTitle,
-                selectedText: selectedText,
+            async let activityResult = inferActivityWithLLM(
+                metadata: metadata,
                 screenshotDataURL: screenshot.dataURL
-            ) {
+            )
+            async let languageResult: String? = includeLanguageDetection
+                ? inferLanguageCodeWithLLM(metadata: metadata, screenshotDataURL: screenshot.dataURL)
+                : nil
+
+            if let result = await activityResult {
                 currentActivity = result.activity
                 contextPrompt = result.prompt
             } else {
@@ -91,6 +102,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
                 )
                 contextPrompt = nil
             }
+            detectedLanguageCode = await languageResult
         } else {
             currentActivity = fallbackCurrentActivity(
                 appName: appName,
@@ -99,6 +111,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
                 windowTitle: windowTitle,
                 screenshotAvailable: screenshot.dataURL != nil
             )
+            detectedLanguageCode = nil
             contextPrompt = nil
         }
 
@@ -108,6 +121,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             windowTitle: windowTitle,
             selectedText: selectedText,
             currentActivity: currentActivity,
+            detectedLanguageCode: detectedLanguageCode,
             contextPrompt: contextPrompt,
             screenshotDataURL: screenshot.dataURL,
             screenshotMimeType: screenshot.mimeType,
@@ -116,10 +130,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     }
 
     private func inferActivityWithLLM(
-        appName: String?,
-        bundleIdentifier: String?,
-        windowTitle: String?,
-        selectedText: String?,
+        metadata: String,
         screenshotDataURL: String?
     ) async -> (activity: String, prompt: String)? {
         let modelsToTry = [
@@ -130,10 +141,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
         for model in modelsToTry {
             let screenshotPayload = model == visionModel ? screenshotDataURL : nil
             if let inferred = await inferActivityWithLLM(
-                appName: appName,
-                bundleIdentifier: bundleIdentifier,
-                windowTitle: windowTitle,
-                selectedText: selectedText,
+                metadata: metadata,
                 screenshotDataURL: screenshotPayload,
                 model: model
             ) {
@@ -145,10 +153,7 @@ Return only two sentences, no labels, no markdown, no extra commentary.
     }
 
     private func inferActivityWithLLM(
-        appName: String?,
-        bundleIdentifier: String?,
-        windowTitle: String?,
-        selectedText: String?,
+        metadata: String,
         screenshotDataURL: String?,
         model: String
     ) async -> (activity: String, prompt: String)? {
@@ -157,13 +162,6 @@ Return only two sentences, no labels, no markdown, no extra commentary.
             request.httpMethod = "POST"
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-            let metadata = """
-App: \(appName ?? "Unknown")
-Bundle ID: \(bundleIdentifier ?? "Unknown")
-Window: \(windowTitle ?? "Unknown")
-Selected text: \(selectedText ?? "None")
-"""
 
             let systemPrompt = customContextPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? Self.defaultContextPrompt
@@ -228,6 +226,97 @@ Selected text: \(selectedText ?? "None")
         }
     }
 
+    private func inferLanguageCodeWithLLM(
+        metadata: String,
+        screenshotDataURL: String?
+    ) async -> String? {
+        let modelsToTry = [
+            screenshotDataURL != nil ? visionModel : fallbackTextModel,
+            fallbackTextModel
+        ]
+
+        for model in modelsToTry {
+            let screenshotPayload = model == visionModel ? screenshotDataURL : nil
+            if let inferred = await inferLanguageCodeWithLLM(
+                metadata: metadata,
+                screenshotDataURL: screenshotPayload,
+                model: model
+            ) {
+                return inferred
+            }
+        }
+
+        return nil
+    }
+
+    private func inferLanguageCodeWithLLM(
+        metadata: String,
+        screenshotDataURL: String?,
+        model: String
+    ) async -> String? {
+        do {
+            var request = URLRequest(url: URL(string: "\(baseURL)/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            let systemPrompt = """
+You infer the likely dictation language for a speech-to-text pipeline from app metadata and an optional screenshot.
+Return exactly one token.
+Use a lowercase ISO-639-1 language code like en, es, fr, ro, de, pt, it, or nl when the likely dictation language is clear.
+Return unknown if the context is ambiguous, code-only, mixed-language, or does not suggest one dominant spoken language.
+"""
+
+            let textOnlyPrompt = "Infer the likely dictation language from this context.\n\n\(metadata)"
+            let userMessage: Any
+
+            if let screenshotDataURL {
+                userMessage = [
+                    [
+                        "type": "text",
+                        "text": "Infer the likely dictation language from this screenshot and metadata. Return only the language code token or unknown."
+                    ],
+                    [
+                        "type": "text",
+                        "text": metadata
+                    ],
+                    [
+                        "type": "image_url",
+                        "image_url": ["url": screenshotDataURL]
+                    ]
+                ]
+            } else {
+                userMessage = textOnlyPrompt
+            }
+
+            let payload: [String: Any] = [
+                "model": model,
+                "temperature": 0.0,
+                "messages": [
+                    ["role": "system", "content": systemPrompt],
+                    ["role": "user", "content": userMessage]
+                ]
+            ]
+
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload, options: [])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                return nil
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let firstChoice = choices.first,
+                  let message = firstChoice["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                return nil
+            }
+
+            return normalizedLanguageCode(content)
+        } catch {
+            return nil
+        }
+    }
+
     private func normalizedActivitySummary(_ value: String) -> String {
         let sentences = value
             .split(whereSeparator: { $0 == "." || $0 == "。" || $0 == "!" || $0 == "?" })
@@ -240,6 +329,79 @@ Selected text: \(selectedText ?? "None")
 
         let firstTwo = sentences.prefix(2)
         return firstTwo.joined(separator: ". ") + "."
+    }
+
+    private func contextMetadata(
+        appName: String?,
+        bundleIdentifier: String?,
+        windowTitle: String?,
+        selectedText: String?
+    ) -> String {
+        """
+App: \(appName ?? "Unknown")
+Bundle ID: \(bundleIdentifier ?? "Unknown")
+Window: \(windowTitle ?? "Unknown")
+Selected text: \(selectedText ?? "None")
+"""
+    }
+
+    private func normalizedLanguageCode(_ value: String) -> String? {
+        let lowered = value.lowercased()
+        let tokens = lowered
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+
+        for token in tokens {
+            if ["unknown", "unclear", "ambiguous", "mixed", "none", "null", "und"].contains(token) {
+                return nil
+            }
+
+            if let code = normalizedLanguageCandidate(token) {
+                return code
+            }
+        }
+
+        return nil
+    }
+
+    private func normalizedLanguageCandidate(_ token: String) -> String? {
+        let candidate = token.split(separator: "-").first.map(String.init) ?? token
+        if candidate.count == 2 || candidate.count == 3, candidate.allSatisfy(\.isLetter) {
+            return candidate
+        }
+
+        let aliases: [String: String] = [
+            "english": "en",
+            "spanish": "es",
+            "french": "fr",
+            "romanian": "ro",
+            "german": "de",
+            "portuguese": "pt",
+            "italian": "it",
+            "dutch": "nl",
+            "catalan": "ca",
+            "chinese": "zh",
+            "japanese": "ja",
+            "korean": "ko",
+            "polish": "pl",
+            "czech": "cs",
+            "danish": "da",
+            "finnish": "fi",
+            "swedish": "sv",
+            "norwegian": "no",
+            "turkish": "tr",
+            "ukrainian": "uk",
+            "russian": "ru",
+            "arabic": "ar",
+            "hindi": "hi",
+            "greek": "el",
+            "hebrew": "he",
+            "hungarian": "hu",
+            "indonesian": "id",
+            "vietnamese": "vi",
+            "thai": "th"
+        ]
+        return aliases[candidate]
     }
 
     private func fallbackCurrentActivity(

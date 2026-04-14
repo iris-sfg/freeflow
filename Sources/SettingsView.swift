@@ -971,6 +971,7 @@ struct PromptsSettingsView: View {
             windowTitle: "System Prompt Test",
             selectedText: nil,
             currentActivity: "User is testing the system prompt in FreeFlow settings.",
+            detectedLanguageCode: nil,
             contextPrompt: nil,
             screenshotDataURL: nil,
             screenshotMimeType: nil,
@@ -1011,6 +1012,16 @@ struct PromptsSettingsView: View {
             Text("Controls how FreeFlow infers your current activity from app metadata and screenshots.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Use detected context language for Whisper transcription", isOn: $appState.useContextLanguageForTranscription)
+                    .toggleStyle(.checkbox)
+                Text("When enabled, FreeFlow uses the current app context to infer a likely dictation language and sends that ISO language hint with the audio upload when it can determine one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
 
             if hasNewerDefault {
                 HStack(spacing: 8) {
@@ -1180,18 +1191,27 @@ struct PromptsSettingsView: View {
         )
 
         Task {
-            let context = await service.collectContext()
+            let context = await service.collectContext(
+                includeLanguageDetection: appState.useContextLanguageForTranscription
+            )
             await MainActor.run {
                 if let prompt = context.contextPrompt {
-                    contextTestOutput = context.contextSummary
+                    contextTestOutput = formatContextTestOutput(context)
                     contextTestPrompt = prompt
                 } else {
                     contextTestError = "Context inference returned no result. This may be a permissions issue or the API could not be reached."
-                    contextTestOutput = context.contextSummary
+                    contextTestOutput = formatContextTestOutput(context)
                 }
                 contextTestRunning = false
             }
         }
+    }
+
+    private func formatContextTestOutput(_ context: AppContext) -> String {
+        guard let detectedLanguageCode = context.detectedLanguageCode else {
+            return context.contextSummary
+        }
+        return "\(context.contextSummary)\n\nDetected language: \(detectedLanguageCode)"
     }
 
 }
@@ -1418,6 +1438,12 @@ struct RunLogEntryView: View {
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                             .textSelection(.enabled)
+                                        if let detectedLanguageCode = item.detectedLanguageCode {
+                                            Text("Detected language: \(detectedLanguageCode)")
+                                                .font(.caption2)
+                                                .foregroundStyle(.tertiary)
+                                                .textSelection(.enabled)
+                                        }
                                     } else {
                                         Text("No context captured")
                                             .font(.caption)

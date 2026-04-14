@@ -127,6 +127,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let shortcutStartDelayStorageKey = "shortcut_start_delay"
     private let preserveClipboardStorageKey = "preserve_clipboard"
     private let forceHTTP2TranscriptionStorageKey = "force_http2_transcription"
+    private let useContextLanguageForTranscriptionStorageKey = "use_context_language_for_transcription"
     private let alertSoundsEnabledStorageKey = "alert_sounds_enabled"
     private let soundVolumeStorageKey = "sound_volume"
     private let voiceMacrosStorageKey = "voice_macros"
@@ -229,6 +230,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var useContextLanguageForTranscription: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                useContextLanguageForTranscription,
+                forKey: useContextLanguageForTranscriptionStorageKey
+            )
+        }
+    }
+
     @Published var alertSoundsEnabled: Bool {
         didSet {
             UserDefaults.standard.set(alertSoundsEnabled, forKey: alertSoundsEnabledStorageKey)
@@ -324,6 +334,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
             ? true
             : UserDefaults.standard.bool(forKey: preserveClipboardStorageKey)
         let forceHTTP2Transcription = UserDefaults.standard.bool(forKey: forceHTTP2TranscriptionStorageKey)
+        let useContextLanguageForTranscription = UserDefaults.standard.bool(
+            forKey: useContextLanguageForTranscriptionStorageKey
+        )
         let soundVolume: Float = UserDefaults.standard.object(forKey: soundVolumeStorageKey) != nil
             ? UserDefaults.standard.float(forKey: soundVolumeStorageKey) : 1.0
         let alertSoundsEnabled = UserDefaults.standard.object(forKey: alertSoundsEnabledStorageKey) != nil
@@ -369,6 +382,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.shortcutStartDelay = shortcutStartDelay
         self.preserveClipboard = preserveClipboard
         self.forceHTTP2Transcription = forceHTTP2Transcription
+        self.useContextLanguageForTranscription = useContextLanguageForTranscription
         self.alertSoundsEnabled = alertSoundsEnabled
         self.soundVolume = soundVolume
         self.voiceMacros = initialMacros
@@ -564,6 +578,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             windowTitle: nil,
             selectedText: nil,
             currentActivity: item.contextSummary,
+            detectedLanguageCode: item.detectedLanguageCode,
             contextPrompt: item.contextPrompt,
             screenshotDataURL: item.contextScreenshotDataURL,
             screenshotMimeType: item.contextScreenshotDataURL != nil ? "image/jpeg" : nil,
@@ -581,7 +596,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         Task {
             do {
-                let rawTranscript = try await transcriptionService.transcribe(fileURL: audioURL)
+                let rawTranscript = try await transcriptionService.transcribe(
+                    fileURL: audioURL,
+                    languageCode: useContextLanguageForTranscription ? restoredContext.detectedLanguageCode : nil
+                )
 
                 let finalTranscript: String
                 let processingStatus: String
@@ -610,6 +628,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         postProcessedTranscript: finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines),
                         postProcessingPrompt: postProcessingPrompt,
                         contextSummary: item.contextSummary,
+                        detectedLanguageCode: item.detectedLanguageCode,
                         contextPrompt: item.contextPrompt,
                         contextScreenshotDataURL: item.contextScreenshotDataURL,
                         contextScreenshotStatus: item.contextScreenshotStatus,
@@ -635,6 +654,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         postProcessedTranscript: item.postProcessedTranscript,
                         postProcessingPrompt: item.postProcessingPrompt,
                         contextSummary: item.contextSummary,
+                        detectedLanguageCode: item.detectedLanguageCode,
                         contextPrompt: item.contextPrompt,
                         contextScreenshotDataURL: item.contextScreenshotDataURL,
                         contextScreenshotStatus: item.contextScreenshotStatus,
@@ -1207,35 +1227,52 @@ final class AppState: ObservableObject, @unchecked Sendable {
             forceHTTP2: forceHTTP2Transcription
         )
         let postProcessingService = PostProcessingService(apiKey: apiKey, baseURL: apiBaseURL)
+        let shouldUseContextLanguage = useContextLanguageForTranscription
 
         Task {
             do {
-                async let transcript = transcriptionService.transcribe(fileURL: transcriptionFileURL)
-                let rawTranscript = try await transcript
-                let appContext: AppContext
-                if let sessionContext {
-                    appContext = sessionContext
-                } else if let inFlightContext = await inFlightContextTask?.value {
-                    appContext = inFlightContext
+                let appContext: AppContext?
+                let rawTranscript: String
+                if shouldUseContextLanguage {
+                    let resolvedContext = await self.resolveTranscriptionContext(
+                        sessionContext: sessionContext,
+                        inFlightContextTask: inFlightContextTask
+                    )
+                    appContext = resolvedContext
+                    rawTranscript = try await transcriptionService.transcribe(
+                        fileURL: transcriptionFileURL,
+                        languageCode: resolvedContext.detectedLanguageCode
+                    )
                 } else {
-                    appContext = fallbackContextAtStop()
+                    async let transcript = transcriptionService.transcribe(fileURL: transcriptionFileURL)
+                    rawTranscript = try await transcript
+                    appContext = nil
+                }
+                let resolvedContext: AppContext
+                if let appContext {
+                    resolvedContext = appContext
+                } else {
+                    resolvedContext = await self.resolveTranscriptionContext(
+                        sessionContext: sessionContext,
+                        inFlightContextTask: inFlightContextTask
+                    )
                 }
                 await MainActor.run { [weak self] in
                     self?.debugStatusMessage = "Running post-processing"
                 }
                 let (finalTranscript, processingStatus, postProcessingPrompt) = await processTranscript(
                     rawTranscript,
-                    context: appContext,
+                    context: resolvedContext,
                     postProcessingService: postProcessingService,
                     customVocabulary: customVocabulary,
                     customSystemPrompt: customSystemPrompt
                 )
 
                 await MainActor.run {
-                    self.lastContextSummary = appContext.contextSummary
-                    self.lastContextScreenshotDataURL = appContext.screenshotDataURL
-                    self.lastContextScreenshotStatus = appContext.screenshotError
-                        ?? "available (\(appContext.screenshotMimeType ?? "image"))"
+                    self.lastContextSummary = resolvedContext.contextSummary
+                    self.lastContextScreenshotDataURL = resolvedContext.screenshotDataURL
+                    self.lastContextScreenshotStatus = resolvedContext.screenshotError
+                        ?? "available (\(resolvedContext.screenshotMimeType ?? "image"))"
                     let trimmedRawTranscript = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                     let trimmedFinalTranscript = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                     self.lastPostProcessingPrompt = postProcessingPrompt
@@ -1246,7 +1283,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         rawTranscript: trimmedRawTranscript,
                         postProcessedTranscript: trimmedFinalTranscript,
                         postProcessingPrompt: postProcessingPrompt,
-                        context: appContext,
+                        context: resolvedContext,
                         processingStatus: processingStatus,
                         audioFileName: savedAudioFile?.fileName
                     )
@@ -1282,14 +1319,10 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     }
                 }
             } catch {
-                let resolvedContext: AppContext
-                if let sessionContext {
-                    resolvedContext = sessionContext
-                } else if let inFlightContext = await inFlightContextTask?.value {
-                    resolvedContext = inFlightContext
-                } else {
-                    resolvedContext = fallbackContextAtStop()
-                }
+                let resolvedContext = await self.resolveTranscriptionContext(
+                    sessionContext: sessionContext,
+                    inFlightContextTask: inFlightContextTask
+                )
                 await MainActor.run {
                     self.transcribingIndicatorTask?.cancel()
                     self.transcribingIndicatorTask = nil
@@ -1333,6 +1366,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             postProcessedTranscript: postProcessedTranscript,
             postProcessingPrompt: postProcessingPrompt,
             contextSummary: context.contextSummary,
+            detectedLanguageCode: context.detectedLanguageCode,
             contextPrompt: context.contextPrompt,
             contextScreenshotDataURL: context.screenshotDataURL,
             contextScreenshotStatus: context.screenshotError
@@ -1363,7 +1397,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         contextCaptureTask = Task { [weak self] in
             guard let self else { return nil }
-            let context = await self.contextService.collectContext()
+            let context = await self.contextService.collectContext(
+                includeLanguageDetection: self.useContextLanguageForTranscription
+            )
             await MainActor.run {
                 self.capturedContext = context
                 self.lastContextSummary = context.contextSummary
@@ -1386,11 +1422,25 @@ final class AppState: ObservableObject, @unchecked Sendable {
             windowTitle: windowTitle,
             selectedText: nil,
             currentActivity: "Could not refresh app context at stop time; using text-only post-processing.",
+            detectedLanguageCode: nil,
             contextPrompt: nil,
             screenshotDataURL: nil,
             screenshotMimeType: nil,
             screenshotError: "No app context captured before stop"
         )
+    }
+
+    private func resolveTranscriptionContext(
+        sessionContext: AppContext?,
+        inFlightContextTask: Task<AppContext?, Never>?
+    ) async -> AppContext {
+        if let sessionContext {
+            return sessionContext
+        }
+        if let inFlightContext = await inFlightContextTask?.value {
+            return inFlightContext
+        }
+        return fallbackContextAtStop()
     }
 
     private func focusedWindowTitle(for app: NSRunningApplication?) -> String? {
